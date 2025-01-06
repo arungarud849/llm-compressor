@@ -12,7 +12,7 @@ from compressed_tensors.utils import (
     update_offload_parameter,
 )
 from loguru import logger
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, field_validator
 
 from llmcompressor.core import State
 from llmcompressor.modifiers import Modifier
@@ -106,6 +106,17 @@ class SparseGPTModifier(Modifier):
     _hessians: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(default_factory=dict)
     _num_samples: Dict[torch.nn.Module, int] = PrivateAttr(default_factory=dict)
     _update_size: Optional[int] = PrivateAttr(default=None)
+
+    @field_validator("sequential_update", mode="before")
+    def validate_sequential_update(cls, value: bool) -> bool:
+        if not value:
+            warnings.warn(
+                "`sequential_update=False` is no longer supported, setting "
+                "sequential_update=True",
+                DeprecationWarning,
+            )
+
+        return True
 
     def on_initialize(self, state: "State", **kwargs) -> bool:
         """
