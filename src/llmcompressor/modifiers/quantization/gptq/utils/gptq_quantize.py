@@ -32,15 +32,14 @@ def make_empty_hessian(
 def accumulate_hessian(
     inp: torch.Tensor,
     module: torch.nn.Module,
-    H: Optional[torch.Tensor] = None,
-    num_samples: int = 1,
+    H: Optional[torch.Tensor],
+    num_samples: int,
 ) -> Tuple[torch.Tensor, int]:
     inp = inp.to(device=H.device)
     if len(inp.shape) == 2:
         inp = inp.unsqueeze(0)
 
-    num_added = inp.shape[0]  # note this is the number of dataset samples, not
-    # multiplied by the sequence length
+    num_added = inp.shape[0]
 
     if isinstance(module, (torch.nn.Linear, transformers.Conv1D)):
         if len(inp.shape) == 3:
@@ -89,22 +88,21 @@ def quantize_weight(
     actorder = quant_args.actorder
     final_shape = module.weight.shape
     final_dtype = module.weight.dtype
-    module_class = type(module)
     W = module.weight.clone()
     H = hessians_dict[module]  # unfortunately python does not have a `move` keyword
     del hessians_dict[module]  # so we have to delete the original reference manually
 
     # create observer for calculating quantization parameters
     observer = Observer.load_from_registry(
-        "minmax",
+        quant_args.observer,
         quantization_args=quant_args,
         averaging_constant=1.0,  # ignore moving average
     )
 
     # standardize shape and dtype
-    if module_class == torch.nn.Conv2d:
+    if isinstance(module, torch.nn.Conv2d):
         W = W.flatten(1)
-    elif module_class == transformers.Conv1D:
+    elif isinstance(module, transformers.Conv1D):
         W.transpose_(0, 1)
     W = W.to(dtype=GPTQ_PRECISION)
     num_rows = W.shape[0]
@@ -163,7 +161,7 @@ def quantize_weight(
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
     except torch._C._LinAlgError:
-        raise ValueError(
+        raise torch._C._LinAlgError(
             "Failed to invert hessian due to numerical instability. Consider "
             "increasing GPTQModifier.dampening_frac, increasing the number "
             "of calibration samples, or shuffling the calibration dataset"
@@ -264,7 +262,7 @@ def quantize_weight(
     if not has_gidx:
         g_idx = None
 
-    if module_class == transformers.Conv1D:
+    if isinstance(module, transformers.Conv1D):
         W.transpose_(0, 1)
     W = W.reshape(final_shape).to(final_dtype)
 
