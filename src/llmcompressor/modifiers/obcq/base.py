@@ -1,17 +1,33 @@
+import contextlib
+import warnings
+from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from compressed_tensors.utils import (
+    align_module_device,
+    get_execution_device,
+    update_offload_parameter,
+)
 from loguru import logger
-from torch.nn import Module
-from tqdm import tqdm
+from pydantic import PrivateAttr
 
 from llmcompressor.core import State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.obcq.utils.sgpt_wrapper import SparseGptWrapper
-from llmcompressor.modifiers.utils.layer_compressor import LayerCompressor
-from llmcompressor.modifiers.utils.pytorch_helpers import run_calibration_forward
+from llmcompressor.modifiers.obcq.utils.sgpt_sparsify import (
+    accumulate_hessian,
+    make_empty_hessian,
+    sparsify_weight,
+)
+from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.pipelines.basic import run_pipeline as run_basic
+from llmcompressor.pipelines.layer_sequential import (
+    run_pipeline as run_layer_sequential,
+)
+from llmcompressor.pipelines.sequential import run_pipeline as run_sequential
+from llmcompressor.utils.metric_logging import CompressionLogger
 from llmcompressor.utils.pytorch.module import (
     get_layers,
     get_no_split_params,
@@ -67,22 +83,29 @@ class SparseGPTModifier(Modifier):
         previously pruned model, defaults to False.
     """
 
-    sparsity: Union[float, List[float]] = 0.0
-    sparsity_profile: Optional[str] = None
-    owl_m: Optional[int] = None
-    owl_lmbda: Optional[float] = None
+    # modifier arguments
+    sparsity: Optional[Union[float, List[float]]] = None
     mask_structure: str = "0:0"
-    sequential_update: Optional[bool] = False
-    targets: Union[str, List[str], None] = None
+    owl_m: Optional[int] = None
+    owl_lmbda: Optional[float] = None  # misspelling?
+    sparsity_profile: Optional[str] = None  # deprecated
     block_size: int = 128
     dampening_frac: Optional[float] = 0.01
-    preserve_sparsity_mask: bool = False
+    preserve_sparsity_mask: bool = False  # deprecate?
+    offload_hessians: bool = False
 
-    model: Optional[Any] = None
-    layer_compressors_: Optional[List[Any]] = None
-    prunen_: Optional[int] = None
-    prunem_: Optional[int] = None
-    compressible_layers_: Optional[List] = None
+    # data pipeline arguments
+    sequential_update: Optional[bool] = False  # deprecated
+    module_targets: Union[str, List[str], None] = None
+    targets: Union[str, List[str], None] = None  # deprecated, clones sequential_targets
+    sequential_targets: Union[str, List[str], None] = None
+
+    # private variables
+    _prune_n: Optional[int] = PrivateAttr(default=None)
+    _prune_m: Optional[int] = PrivateAttr(default=None)
+    _hessians: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(default_factory=dict)
+    _num_samples: Dict[torch.nn.Module, int] = PrivateAttr(default_factory=dict)
+    _update_size: Optional[int] = PrivateAttr(default=None)
 
     def on_initialize(self, state: "State", **kwargs) -> bool:
         """
@@ -90,192 +113,169 @@ class SparseGPTModifier(Modifier):
 
         :param state: session state storing input model and calibration data
         """
-        if self.sparsity == 0.0:
-            raise ValueError(
-                "To use the SparseGPTModifier, target sparsity must be > 0.0"
-            )
+        model = state.model
+        dataloader = state.data.calib
 
-        modifiable_model = state.model
-        calibration_dataloader = state.data.calib
+        # infer module and sequential targets
+        self.sequential_targets = self._infer_sequential_targets(model)
 
-        if self.targets is None:
-            # if no targets are provided, default to the modules that shouldn't be
-            # split by FSDP. For Transformers models this is equivalent to the
-            # decoder layers (ie LlamaDecoderLayer)
-            self.targets = get_no_split_params(modifiable_model)
-
-        self.initialize_compression(modifiable_model, calibration_dataloader)
-        self.apply_compression(calibration_dataloader)
-
-        return True
-
-    def initialize_compression(
-        self,
-        model: Module,
-        dataloader: Optional[Iterable[Tuple[List, Dict[str, Any]]]] = None,
-    ):
-        """
-        Setup for SparseGPT, initializes the model, device,
-        and other parameters, also initilializes the
-        compressible layers of model, and sets the device
-
-        :param model: model to initialize for compression
-        """
-        self.model = model
-        self.compressible_layers_ = self.compressible_layers()
-        self.layer_compressors_ = []
-        self._infer_mask_block_size()
-
-        if self.sparsity_profile is not None and self.sparsity_profile.lower() == "owl":
+        # infer layer sparsities
+        if self.owl_m is not None and self.owl_lmbda is not None:
             logger.info(
-                "Inferring layer-wise sparsities from "
-                f"{len(dataloader)} calibration samples..."
+                "Using OWL to infer target layer-wise sparsities from "
+                f"{len(dataloader) if dataloader else 0} calibration samples..."
             )
-            activations = self._get_activations(dataloader)
-            self.sparsity = self._infer_layer_sparsity(activations)
-        self._validate_layerwise_sparsity()
+            self.sparsity = self._infer_owl_layer_sparsity()
 
-        for idx, (name, layer) in enumerate(self.compressible_layers_.items()):
-            logger.info(f"Preparing {name} for compression")
+        # register hooks
+        for index, name, layer in enumerate(get_layers(self.sequential_targets, model)):
             if isinstance(self.sparsity, Dict):
                 layer_sparsity = self.sparsity[name]
             elif isinstance(self.sparsity, List):
-                layer_sparsity = self.sparsity[idx]
-            else:  # float
+                layer_sparsity = self.sparsity[index]
+            else:
                 layer_sparsity = self.sparsity
-            args = self._pruning_arguments(layer_sparsity)
-            comp_cls = self._compression_class()
-            compressor = LayerCompressor(comp_cls, self.model, layer, idx, name, args)
-            if not self.sequential_update:
-                # add all batch processing hooks before the forward pass
-                compressor.pre_compress()
-            self.layer_compressors_.append(compressor)
 
-    def compressible_layers(self) -> Dict:
-        """
-        Retrieves the modules corresponding to a list of
-        compressible layer names
+            for name, module in get_prunable_layers(layer):
+                post_hook = partial(
+                    self.compress_module,
+                    name,
+                    layer_sparsity,
+                )
+                self.register_hook(module, post_hook, "forward")
 
-        :precondition: self.model is set and is a torch.nn.Module
-        :return: dictionary of modules to compress
-        """
-        if not isinstance(self.model, Module):
-            raise ValueError(
-                "`self.model` must be a PyTorch Module to use "
-                f"the {self.__class__.__qualname__} modifier but got "
-                f"{type(self.model)} instead"
+        # infer and run pipeline
+        model_name = state.model.__class__.__name__
+        input_names = state.data.calib.dataset.column_names
+        unfixable_errors = (torch.OutOfMemoryError, torch._C._LinAlgError)
+        try:
+            run_sequential(
+                state.model,
+                self.sequential_targets,
+                self.ignore,
+                state.data.calib,
+                propagate_error=True,
+            )
+            return True
+
+        except Exception as exception:
+            if isinstance(exception, torch.fx.proxy.TraceError):
+                warnings.warn(f"Failed to trace {model_name} with inputs {input_names}")
+            if isinstance(exception, unfixable_errors):
+                raise exception
+
+            warnings.warn("Falling back to layer_sequential pipeline")
+            try:
+                run_layer_sequential(
+                    state.model,
+                    self.sequential_targets,
+                    state.data.calib,
+                    propagate_error=True,
+                )
+                return True
+
+            except Exception as exception:
+                if isinstance(exception, TypeError):
+                    warnings.warn(f"{model_name} fails layer-wise assumptions")
+                if isinstance(exception, unfixable_errors):
+                    raise exception
+
+                warnings.warn(
+                    "Falling back to basic pipeline, which requires extra memory and "
+                    "may result in decreased accuracy"
+                )
+                run_basic(state.model, state.data.calib)
+                return True
+
+        return True
+
+    def compress_module(
+        self,
+        name: str,
+        sparsity: float,
+        module: torch.nn.Module,
+        args: Tuple[torch.Tensor, ...],
+        _output: torch.Tensor,
+    ):
+        # Assume that the first argument is the input
+        inp = args[0]
+
+        # Initialize hessian if not present
+        if module not in self._num_samples:
+            device = get_execution_device(module)
+            self._hessians[module] = make_empty_hessian(module, device=device)
+            self._num_samples[module] = 0
+
+        # Accumulate hessian with input with optional offloading
+        with self._maybe_onload_hessian(module):
+            self._hessians[module], self._num_samples[module] = accumulate_hessian(
+                inp,
+                module,
+                self._hessians[module],
+                self._num_samples[module],
             )
 
-        return get_layers(self.targets, self.model)
+        # After enough samples are accumulated, perform sparsification
+        if self._num_samples[module] >= self._update_size:
+            logger.info(f"Sparsifying {name} using {self._num_samples[module]} samples")
+            with (
+                torch.no_grad(),
+                align_module_device(module),
+                CompressionLogger(module) as comp_logger,
+            ):
+                loss, sparsified_weight = sparsify_weight(
+                    module=module,
+                    hessians_dict=self._hessians,
+                    sparsity=sparsity,
+                    prune_n=self._prune_n,
+                    prune_m=self._prune_m,
+                    block_size=self.block_size,
+                    dampening_frac=self.dampening_frac,
+                    preserve_sparsity_mask=self.preserve_sparsity_mask,  #  TODO: should we deprecate this? GPTQ just checks against a sparsity threshold
+                )
+                comp_logger.set_loss(loss)
 
-    @torch.no_grad()
-    def apply_compression(
-        self, dataloader: Optional[Iterable[Tuple[List, Dict[str, Any]]]] = None
-    ) -> Dict:
-        """
-        Run Wanda on the loaded model, using dataloader as calibration data
+            update_offload_parameter(module, "weight", sparsified_weight)
 
-        :param dataloader: calibration data for WANDA
-        """
-        class_name = self.__class__.__name__.replace("PyTorch", "")
-        logger.info(
-            f"Running {class_name} calibration with "
-            f"{len(dataloader) if dataloader else 0} samples..."
-        )
-        if not self.sequential_update:
-            # in non-sequential mode we run one forward batch for all modules
-            run_calibration_forward(self.model, dataloader, mask_padding=True)
+            # self._hessians[module] already deleted by sparsify_weight
+            del self._num_samples[module]
 
-        num_layers = len(self.compressible_layers_)
-        for idx, layer_compressor in enumerate(self.layer_compressors_):
-            layer_sparsity = layer_compressor.args["sparsity"]
-            logger.info(
-                f"\n===== Compressing layer {idx+1}/{num_layers} "
-                f"to sparsity {layer_sparsity} ====="
-            )
+    @contextlib.contextmanager
+    def _maybe_onload_hessian(self, module: torch.nn.Module):
+        if self.offload_hessians:
+            device = get_execution_device(module)
+            self._hessians[module] = self._hessians[module].to(device=device)
 
-            # Prune/quantize using SparseGPT
-            if self.sequential_update:
-                # in sequential mode we run one forward pass for each module we
-                # want to compress, this will be really slow but allows compression in
-                # earlier layers to affect later layers
-                layer_compressor.pre_compress()
-                logger.info(f"Calibrating {layer_compressor.name}...")
-                run_calibration_forward(self.model, dataloader, mask_padding=True)
-            layer_compressor.compress()
-            layer_compressor.post_compress()
-            layer_compressor.revert_layer_wrappers()
-            torch.cuda.empty_cache()
+        yield
 
-    def _validate_layerwise_sparsity(self):
-        if isinstance(self.sparsity, float):
-            # single sparsity will be applied to all layers
-            return
+        if self.offload_hessians:
+            if module in self._hessians:  # may have been deleted in context
+                self._hessians[module] = self._hessians[module].to(device="cpu")
 
-        target_layers = list(self.compressible_layers_.keys())
+    def _infer_sequential_targets(self, model):
+        if self.sequential_targets is None:
+            return get_no_split_params(model)
+        if isinstance(self.sequential_targets, str):
+            return [self.sequential_targets]
 
-        if len(target_layers) != len(self.sparsity):
-            raise ValueError(
-                "Number of layer targets must match the number of sparsities. "
-                "Received {len(target_layers)} layers and "
-                f"{len(self.sparsity)} sparsities"
-            )
-
-    def _pruning_arguments(self, sparsity):
-        """
-        Gather the parameters needed for root module compression in a dict
-
-        :param sparsity: target sparsity
-        :return: dict of params for pruning
-        """
-        return {
-            "sparsity": sparsity,
-            "prunen": self.prunen_,
-            "prunem": self.prunem_,
-            "blocksize": self.block_size,
-            "percdamp": self.dampening_frac,
-            "preserve_sparsity_mask": self.preserve_sparsity_mask,
-        }
-
-    def _compression_class(self):
-        """
-        :return: wrapper class used for root modules of this compression class
-        """
-        return SparseGptWrapper
-
-    def _infer_mask_block_size(self):
-        """
-        Infer the mask block size from the mask structure.
-        Parses mask_structure of the form N:M where N, M are integers that
-        define a custom block shape; and sets prunen_ and prunem_ accordingly.
-
-        :post-condition: prunen_ and prunem_ are set
-        """
-        if self.mask_structure is None:
-            raise ValueError("mask_structure must be defined")
-
-        self.prunen_, self.prunem_ = list(map(int, self.mask_structure.split(":")))
-
-    def _infer_layer_sparsity(self, activations):
-        sparsegpt_groups = {}
+    def _infer_owl_layer_sparsity(self, activations):
+        groups = {}
         for name, layer in self.compressible_layers_.items():
             prunable_layers = get_prunable_layers(layer)
             z = [
                 m.weight.abs() * activations[f"{name}.{n}"].unsqueeze(0)
                 for n, m in prunable_layers.items()
             ]
-            sparsegpt_groups[name] = torch.cat([item.flatten().cpu() for item in z])
+            groups[name] = torch.cat([item.flatten().cpu() for item in z])
 
         del activations
         torch.cuda.empty_cache()
 
         outlier_ratios = {}
-        for group in sparsegpt_groups:
-            threshold = torch.mean(sparsegpt_groups[group]) * self.owl_m
+        for group in groups:
+            threshold = torch.mean(groups[group]) * self.owl_m
             outlier_ratios[group] = (
-                100
-                * (sparsegpt_groups[group] > threshold).sum().item()
-                / sparsegpt_groups[group].numel()
+                100 * (groups[group] > threshold).sum().item() / groups[group].numel()
             )
         outlier_ratios_arr = np.array([outlier_ratios[k] for k in outlier_ratios])
         for k in outlier_ratios:
@@ -300,34 +300,23 @@ class SparseGPTModifier(Modifier):
             logger.info(f"Sparsity for {k}: {sparsities[k]}")
         return sparsities
 
-    @torch.no_grad()
-    def _get_activations(self, data_loader, nsamples=128):
-        self.model.eval()
-        acts = {}
+    def _get_activations(self, model, dataloader, nsamples=128):
+        acts = defaultdict(int)
 
-        def save_acts(module, input, name):
+        def save_acts(_module, input, name):
+            nonlocal acts
             if isinstance(input, tuple):
                 input = input[0]
-            if name not in acts:
-                acts[name] = (
-                    1.0 / nsamples * input.detach().pow(2).sum(dim=(0, 1)).sqrt()
-                )
-            else:
-                acts[name] += (
-                    1.0 / nsamples * input.detach().pow(2).sum(dim=(0, 1)).sqrt()
-                )
+            acts[name] += 1.0 / nsamples * input.pow(2).sum(dim=(0, 1)).sqrt()
 
-        for name, mod in self.model.named_modules():
-            if isinstance(mod, torch.nn.Linear) and "lm_head" not in name:
-                self.register_hook(mod, partial(save_acts, name=name), "forward_pre")
-
-        device = next(self.model.parameters()).device
-        for batch in tqdm(data_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            self.model(**batch)
-            batch = None
-        torch.cuda.empty_cache()
-
-        self.remove_hooks()
+        # TODO: only add hooks to target modules
+        hooks = set(
+            self.register_hook(mod, partial(save_acts, name=name), "forward_pre")
+            for name, mod in model.named_modules()
+            if isinstance(mod, torch.nn.Linear) and "lm_head" not in name
+        )
+        with HooksMixin.disable_hooks(keep=hooks):
+            run_basic(model, dataloader)
+        self.remove_hooks(hooks)
 
         return acts
