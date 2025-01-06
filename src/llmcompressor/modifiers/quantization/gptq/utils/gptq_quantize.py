@@ -144,8 +144,6 @@ def quantize_weight(
         else None
     )
 
-    losses = torch.zeros(num_rows, device=module.weight.device)
-
     # mask dead hessian values
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
@@ -166,6 +164,8 @@ def quantize_weight(
             "increasing GPTQModifier.dampening_frac, increasing the number "
             "of calibration samples, or shuffling the calibration dataset"
         )
+
+    losses = torch.zeros(num_rows, device=module.weight.device)
 
     # See section 3.4 of https://arxiv.org/abs/2203.07259
     for i1 in range(0, num_columns, blocksize):
