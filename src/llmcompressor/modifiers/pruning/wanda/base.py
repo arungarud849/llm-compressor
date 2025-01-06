@@ -80,26 +80,28 @@ class WandaPruningModifier(Modifier):
             )
         return None
 
-    @field_validator("targets", mode="before")
-    def validate_targets(cls, value) -> None:
-        if value is not None:
-            warnings.warn(
-                "`targets` is deprecated, use `module_targets` and `sequential_targets`"
-            )
-        return None
-
     @model_validator(mode="after")
     def validate_model_after(model: "WandaPruningModifier") -> Dict[str, Any]:
         sparsity = model.sparsity
         owl_m = model.owl_m
         owl_lmbda = model.owl_lmbda
         mask_structure = model.mask_structure
+        targets = model.targets
+        sequential_targets = model.sequential_targets
 
         if (owl_m is not None) ^ (owl_lmbda is not None):
             raise ValueError("Must provide both `owl_m` and `owl_lmbda` or neither")
 
         if owl_m is not None and sparsity is not None:
             raise ValueError("Cannot provide both sparsity and owl parameters")
+
+        if targets is not None:
+            warnings.warn(
+                "`targets` is deprecated, use `module_targets` and `sequential_targets`"
+            )
+            if sequential_targets is not None:
+                raise ValueError("Cannot use both `targets` and `sequential_targets`")
+            model.sequential_targets = targets
 
         model._prune_n, model._prune_m = mask_structure.split(":")
 
@@ -142,8 +144,6 @@ class WandaPruningModifier(Modifier):
                     self.compress_module,
                     name,
                     layer_sparsity,
-                    self._prune_n,
-                    self._prune_m,
                 )
                 self.register_hook(module, post_hook, "forward")
 
@@ -194,8 +194,6 @@ class WandaPruningModifier(Modifier):
         self,
         name: str,
         sparsity: float,
-        prune_n: int,
-        prune_m: int,
         module: torch.nn.Module,
         args: Tuple[torch.Tensor, ...],
         _output: torch.Tensor,
@@ -217,7 +215,7 @@ class WandaPruningModifier(Modifier):
             self._num_samples[module],
         )
 
-        # After enough samples are accumulated, perform quantization
+        # After enough samples are accumulated, perform sparsification
         if self._num_samples[module] >= self._update_size:
             logger.info(f"Sparsifying {name} using {self._num_samples[module]} samples")
             with (
@@ -229,13 +227,13 @@ class WandaPruningModifier(Modifier):
                     module=module,
                     row_scalars_dict=self._row_scalars,
                     sparsity=sparsity,
-                    prune_n=prune_n,
-                    prune_m=prune_m,
+                    prune_n=self._prune_n,
+                    prune_m=self._prune_m,
                 )
 
             update_offload_parameter(module, "weight", sparsified_weight)
 
-            # self._hessians[module] already deleted by quantize_weight
+            # self._hessians[module] already deleted by sparsify_weight
             del self._num_samples[module]
 
     def _infer_sequential_targets(self, model):
@@ -293,7 +291,7 @@ class WandaPruningModifier(Modifier):
     def _get_activations(self, model, dataloader, nsamples=128):
         acts = defaultdict(int)
 
-        def save_acts(module, input, name):
+        def save_acts(_module, input, name):
             nonlocal acts
             if isinstance(input, tuple):
                 input = input[0]
@@ -302,7 +300,7 @@ class WandaPruningModifier(Modifier):
         # TODO: only add hooks to target modules
         hooks = set(
             self.register_hook(mod, partial(save_acts, name=name), "forward_pre")
-            for name, mod in self.model.named_modules()
+            for name, mod in model.named_modules()
             if isinstance(mod, torch.nn.Linear) and "lm_head" not in name
         )
         with HooksMixin.disable_hooks(keep=hooks):
